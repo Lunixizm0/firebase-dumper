@@ -23,7 +23,7 @@ const { program } = require("commander");
 program
   .name("firebase-dump")
   .description("Dump Firebase project data via Admin SDK")
-  .version("3.0.0")
+  .version("4.0.2")
   .option("-k, --key <path>", "Path to service account JSON key", "./serviceAccountKey.json")
   .option("-o, --out <dir>", "Output directory for dumped files", "./firebase_dump")
   .option("-u, --db-url <url>", "Realtime Database URL (optional)")
@@ -34,11 +34,36 @@ program
 
 const opts = program.opts();
 
-// Validates that a file path is safe
-function isSafePath(targetPath, baseDir = process.cwd()) {
-  const resolved = path.resolve(targetPath);
-  const base = path.resolve(baseDir);
-  return resolved.startsWith(base) || path.isAbsolute(resolved);}
+
+// Path safety
+const BLOCKED_ROOTS = [
+  "/etc", "/sys", "/proc", "/dev", "/run", "/root", "/boot",
+  "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/lib", "/lib64",
+  "/snap", "/tmp",];
+
+function isSafePath(inputPath) {
+  // Raw-input checks
+  // "foo/../../etc" or "foo%2F..%2F.." etc
+  if (/(\.\.[/\\])|(^\.\.([/\\]|$))/.test(inputPath)) {
+    return false;}
+
+  // Reject null bytes and common shell meta-characters 
+  if (/[\x00-\x1f|;&`$<>!]/.test(inputPath)) {
+    return false;}
+
+  const resolved = path.resolve(inputPath);
+
+  // Must not be the filesystem root
+  if (resolved === path.parse(resolved).root.replace(/[/\\]$/, "") ||
+      resolved === "/" || resolved === "\\") {
+    return false;}
+
+  // Must not target a sensitive directory
+  for (const blocked of BLOCKED_ROOTS) {
+    if (resolved === blocked || resolved.startsWith(blocked + path.sep)) {
+      return false;}}
+
+  return true;}
 
 // Validates that the service account key file exists and is readable
 function validateKeyFile(keyPath) {
@@ -55,7 +80,7 @@ function validateKeyFile(keyPath) {
   if (process.platform !== "win32") {
     const mode = stats.mode & 0o777;
     if (mode & 0o044) {
-      console.warn(`Warn: Service account key is readable by others (${mode.toString(8)}). Consider chmod 600.`);}}}
+      console.warn(`Warn: Service account key is readable by others (${mode.toString(8)}). Consider chmod 600`);}}}
 
 // creates the output directory
 function ensureOutputDir(dirPath) {
@@ -107,13 +132,21 @@ const ENABLED_SERVICES = parseServices(opts.services);
 // validate input
 validateKeyFile(SERVICE_KEY_PATH);
 
-if (!isSafePath(SERVICE_KEY_PATH)) {
-  console.error("Err: Service account key path contains directory traversal.");
+if (!isSafePath(OUTPUT_DIR)) {
+  console.error("Err: Output directory path is unsafe");
   process.exit(1);}
 
-if (!isSafePath(OUTPUT_DIR)) {
-  console.error("Err: Output directory path contains directory traversal.");
+if (BUCKET_OVERRIDE && !/^https?:\/\//i.test(BUCKET_OVERRIDE) && !isSafePath(BUCKET_OVERRIDE)) {
+  console.error("Err: --bucket value contains illegal characters");
   process.exit(1);}
+
+if (DB_URL) {
+  try { new URL(DB_URL); } catch {
+    console.error("Err: --db-url is not a valid URL.");
+    process.exit(1);}
+  if (!/^https:\/\/[a-zA-Z0-9_-]+\.firebaseio\.com\/?$/.test(DB_URL)) {
+    console.error("Err: --db-url must be a Firebase RTDB URL (https://<project>.firebaseio.com)");
+    process.exit(1);}}
 
 ensureOutputDir(OUTPUT_DIR);
 
@@ -148,7 +181,6 @@ const { getDatabase } = require("firebase-admin/database");
 const { getAuth } = require("firebase-admin/auth");
 const { getStorage } = require("firebase-admin/storage");
 const { getSecurityRules } = require("firebase-admin/security-rules");
-const { getAppCheck } = require("firebase-admin/app-check");
 const { getMessaging } = require("firebase-admin/messaging");
 const { getRemoteConfig } = require("firebase-admin/remote-config");
 const { getMachineLearning } = require("firebase-admin/machine-learning");
@@ -190,7 +222,7 @@ const results = {
   errors: [],
   skipped: [],};
 
-// Tracks status per service for the final summary
+// Tracks status per service for the summary table
 const SERVICE_STATUS = {};
 
 // Console formatting helpers
@@ -213,8 +245,6 @@ function warn(msg) {
   if (!QUIET) console.log(`  ${c.yellow("*")} ${msg}`);}
 
 // Error/skip classification
-// True when the failure means "this Google/Firebase API is simply not
-// enabled for the project"
 function isApiDisabledError(e) {
   const msg = e?.message || String(e);
   return /has not been used in project|it is disabled|SERVICE_DISABLED/i.test(msg);}
@@ -224,7 +254,6 @@ function isNotFoundError(e) {
   const msg = e?.message || String(e);
   return /\bNOT_FOUND\b|not found/i.test(msg);}
 
-//Logs a expected condition
 function logSkipped(service, reason) {
   results.skipped.push({ service, reason });
   SERVICE_STATUS[service] = { status: "skipped", detail: reason };
@@ -409,10 +438,9 @@ async function dumpAuth() {
 
 /**
  * Dumps object metadata from a publicly-listable S3-compatible bucket
- * (no AWS credentials) This only works if the buckets
- * XML listing endpoint is already open it Only key/size/etag/timestamp metadata is
- * captured mirroring dumpStorage()s Firebase behaviour no object content
- * is ever downloaded
+ * (no AWS credentials) This only works if the buckets 
+ * XML listing endpoint is already Only key/size/etag/timestamp metadata is
+ * captured no object content is ever downloaded.
  */
 async function dumpPublicBucket(bucketUrl) {
   const base = bucketUrl.endsWith("/") ? bucketUrl : `${bucketUrl}/`;
@@ -420,7 +448,7 @@ async function dumpPublicBucket(bucketUrl) {
   const objects = [];
   let bucketName = null;
   let page = 0;
-  const MAX_PAGES = 50; // safety cap so a huge/adversarial bucket cant loop forever
+  const MAX_PAGES = 50; 
 
   do {
     const params = new URLSearchParams({ "list-type": "2" });
@@ -460,18 +488,18 @@ async function dumpPublicBucket(bucketUrl) {
       : null;
 
     if (continuationToken && page >= MAX_PAGES) {
-      warn(`Reached ${MAX_PAGES}-page cap stopping pagination early`);
+      warn(`Reached ${MAX_PAGES}-page cap, stopping pagination early.`);
       break;}
   } while (continuationToken);
 
   results.storage.buckets.push({ name: bucketName, source: "public-anonymous-listing", url: bucketUrl });
   results.storage.files[bucketName] = objects;
-  ok(`[${bucketName}] => ${objects.length} objects listed`);
+  ok(`[${bucketName}] => ${objects.length} objects listed (metadata only, no content downloaded)`);
   SERVICE_STATUS.storage = { status: "ok" };}
 
 /**
- * Dumps cloud storage buckets and file metadata
- * Does NOT download file contents
+ * Dumps cloud storage buckets and file metadata.
+ * Does NOT download file contents.
  */
 async function dumpStorage() {
   if (!ENABLED_SERVICES.has("storage")) return;
@@ -502,8 +530,8 @@ async function dumpStorage() {
 
     if (!bucket) {
       throw new Error(
-        `No accessible bucket found (tried: ${candidateNames.join(", ")}) ` +
-        `Pass --bucket <name> explicitly Last error: ${lastErr?.message}`);}
+        `No accessible bucket found (tried: ${candidateNames.join(", ")}). ` +
+        `Pass --bucket <name> explicitly. Last error: ${lastErr?.message}`);}
 
     const [metadata] = await bucket.getMetadata();
     results.storage.buckets.push({
@@ -566,7 +594,7 @@ async function dumpSecurityRules() {
   try {
     const securityRules = getSecurityRules(app);
 
-    // The SDK only exposes whatever ruleset is currently deployed
+    // The SDK only exposes whatever ruleset is currently deployed per service.
     let allMetadata = [];
     let pageToken;
     try {
@@ -621,34 +649,89 @@ async function dumpSecurityRules() {
         logError("securityRules.getStorageRuleset", inner);}}
 
     if (!QUIET) {
-      console.log(`  [OK] ${allMetadata.length} rulesets, ${results.securityRules.releases.length} active releases`);}
+      console.log(`  ${allMetadata.length} rulesets, ${results.securityRules.releases.length} active releases`);}
     SERVICE_STATUS.securityRules = SERVICE_STATUS.securityRules || { status: "ok" };
   } catch (e) {
     logError("securityRules", e);}}
 
-//Checks App Check accessibilit
+//Probes App Check via REST the firebase-admin SDK has no enumeration API
+// so we use the service-account credential to call the App Check REST endpoint
+// that lists apps registered with App Check for the project.
 async function dumpAppCheck() {
   if (!ENABLED_SERVICES.has("appCheck")) return;
-  if (!QUIET) console.log("\n[App Check] Starting dump...");
+  section("App Check");
 
   try {
-    const appCheck = getAppCheck(app);
-    results.appCheck = { available: true, note: "App Check instance accessible" };
-    if (!QUIET) console.log(" App Check accessible");
+    const tokenResult = await app.options.credential.getAccessToken();
+    const accessToken = tokenResult.access_token;
+
+    const url = `https://firebaseappcheck.googleapis.com/v1/projects/${projectId}/apps`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(15000),});
+    const body = await resp.text();
+
+    if (resp.status === 401 || resp.status === 403) {
+      logSkipped("appCheck",
+        `Permission denied — credential needs roles/firebase.sdkAdminServiceAgent or ` +
+        `firebaseappcheck.apps.list IAM permission`);
+      return;}
+
+    if (resp.status === 404 || isNotFoundError({ message: body })) {
+      logSkipped("appCheck", "No App Check apps configured for this project");
+      return;}
+
+    if (isApiDisabledError({ message: body })) {
+      logSkipped("appCheck", "Firebase App Check API is not enabled for this project");
+      return;}
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 300)}`);}
+
+    const data = JSON.parse(body);
+    const apps = data.apps || [];
+    results.appCheck = {
+      available: true,
+      appCount: apps.length,
+      apps: apps.map(a => ({
+        name: a.name,
+        appId: a.appId,
+        displayName: a.displayName,
+        tokenTtl: a.appCheckTokenTtl,})),};
+
+    ok(`App Check: ${apps.length} app(s) listed`);
     SERVICE_STATUS.appCheck = { status: "ok" };
   } catch (e) {
     results.appCheck = { available: false, error: e.message };
     logError("appCheck", e);}}
 
-// Checks FCM (Firebase Cloud Messaging) accessibility
+// Probes FCM with a dry-run send This makes a real API call to the FCM
+// endpoint dryRun=true means no actual push is dispatched The probe token
+// is intentionally invalid we expect INVALID_ARGUMENT back which still
+// proves the credential is authorised and the API is reachable
 async function dumpFCM() {
   if (!ENABLED_SERVICES.has("fcm")) return;
-  if (!QUIET) console.log("\n[FCM] Starting dump...");
+  section("FCM");
 
   try {
     const messaging = getMessaging(app);
-    results.fcm = { accessible: true, note: "FCM messaging() instance accessible" };
-    if (!QUIET) console.log("  FCM accessible");
+    let note;
+    try {
+      await messaging.send({ token: "firebase-dump-probe" }, true /* dryRun */);
+      note = "dry-run send succeeded";
+    } catch (probeErr) {
+      const msg = probeErr?.message || "";
+      if (/INVALID_ARGUMENT|invalid-registration-token|registration-token-not-registered/i.test(msg)) {
+        // Expected: the probe token was rejected after the auth layer accepted
+        note = "API reachable credentials valid";
+      } else if (isApiDisabledError(probeErr)) {
+        logSkipped("fcm", "Firebase Cloud Messaging API is not enabled for this project");
+        return;
+      } else {
+        throw probeErr;}}
+
+    results.fcm = { accessible: true, note };
+    ok(`FCM: ${note}`);
     SERVICE_STATUS.fcm = { status: "ok" };
   } catch (e) {
     logError("fcm", e);}}
