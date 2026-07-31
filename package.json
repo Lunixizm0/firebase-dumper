@@ -25,6 +25,6 @@
   "dependencies": {
     "@firebase/app": "^0.16.0",
     "commander": "^11.1.0",
-    "firebase-admin": "^12.0.0"
+    "firebase-admin": "^14.2.0"
   }
 }
