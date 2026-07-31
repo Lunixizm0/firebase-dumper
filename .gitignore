@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Service Account Keys
+serviceAccountKey.json
+*service-account*.json
+*firebase-adminsdk*.json
+*.key.json
+secrets/
+credentials/
+
+# Output directories
+firebase_dump/
+output/
+dumps/
+dump/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
