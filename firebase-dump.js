@@ -23,23 +23,24 @@ const { program } = require("commander");
 program
   .name("firebase-dump")
   .description("Dump Firebase project data via Admin SDK")
-  .version("2.2.1")
+  .version("3.0.0")
   .option("-k, --key <path>", "Path to service account JSON key", "./serviceAccountKey.json")
   .option("-o, --out <dir>", "Output directory for dumped files", "./firebase_dump")
   .option("-u, --db-url <url>", "Realtime Database URL (optional)")
+  .option("-b, --bucket <name>", "Storage bucket name, or a public bucket URL")
   .option("-s, --services <list>", "Comma separated services to dump (default: all)", "all")
   .option("-q, --quiet", "Suppress non error output", false)
   .parse();
 
 const opts = program.opts();
 
-// Validates that a file path is safe 
+// Validates that a file path is safe
 function isSafePath(targetPath, baseDir = process.cwd()) {
   const resolved = path.resolve(targetPath);
   const base = path.resolve(baseDir);
   return resolved.startsWith(base) || path.isAbsolute(resolved);}
 
-// Validates that the service account key file exists and is readable.
+// Validates that the service account key file exists and is readable
 function validateKeyFile(keyPath) {
   if (!fs.existsSync(keyPath)) {
     console.error(`Err: Service account key not found: ${keyPath}`);
@@ -99,6 +100,7 @@ function parseServices(servicesOpt) {
 const SERVICE_KEY_PATH = path.resolve(opts.key);
 const OUTPUT_DIR = path.resolve(opts.out);
 const DB_URL = opts.dbUrl || null;
+const BUCKET_OVERRIDE = opts.bucket || null;
 const QUIET = opts.quiet;
 const ENABLED_SERVICES = parseServices(opts.services);
 
@@ -179,18 +181,54 @@ const results = {
   auth: { users: [], stats: {} },
   storage: { buckets: [], files: {} },
   projectConfig: null,
-  securityRules: { releases: [], rulesets: [] },
+  securityRules: { releases: [], rulesetMetadata: [], rulesets: [] },
   appCheck: null,
   fcm: { accessible: false },
   remoteConfig: null,
   ml: null,
   customClaims: {},
-  errors: [],};
+  errors: [],
+  skipped: [],};
 
+// Tracks status per service for the final summary
+const SERVICE_STATUS = {};
 
-// Utilities 
+// Console formatting helpers
+const COLOR = process.env.NO_COLOR ? false : true;
+const c = {
+  bold: s => (COLOR ? `\x1b[1m${s}\x1b[0m` : s),
+  dim: s => (COLOR ? `\x1b[2m${s}\x1b[0m` : s),
+  green: s => (COLOR ? `\x1b[32m${s}\x1b[0m` : s),
+  yellow: s => (COLOR ? `\x1b[33m${s}\x1b[0m` : s),
+  red: s => (COLOR ? `\x1b[31m${s}\x1b[0m` : s),
+  cyan: s => (COLOR ? `\x1b[36m${s}\x1b[0m` : s),};
 
-//Writes JSON data to a file in the output directory.
+function section(title) {
+  if (!QUIET) console.log(`\n${c.bold(c.cyan("> " + title))}`);}
+
+function ok(msg) {
+  if (!QUIET) console.log(`  ${c.green("+")} ${msg}`);}
+
+function warn(msg) {
+  if (!QUIET) console.log(`  ${c.yellow("*")} ${msg}`);}
+
+// Error/skip classification
+// True when the failure means "this Google/Firebase API is simply not
+// enabled for the project"
+function isApiDisabledError(e) {
+  const msg = e?.message || String(e);
+  return /has not been used in project|it is disabled|SERVICE_DISABLED/i.test(msg);}
+
+// True when the failure means "nothing exists yet"
+function isNotFoundError(e) {
+  const msg = e?.message || String(e);
+  return /\bNOT_FOUND\b|not found/i.test(msg);}
+
+//Logs a expected condition
+function logSkipped(service, reason) {
+  results.skipped.push({ service, reason });
+  SERVICE_STATUS[service] = { status: "skipped", detail: reason };
+  warn(`${service}: ${reason}`);}
 function saveJson(name, data) {
   const filePath = path.join(OUTPUT_DIR, `${name}.json`);
   try {
@@ -204,7 +242,8 @@ function saveJson(name, data) {
 function logError(service, err) {
   const msg = err?.message || String(err);
   results.errors.push({ service, error: msg });
-  console.error(`[${service}] Error:`, msg);}
+  SERVICE_STATUS[service] = { status: "error", detail: msg };
+  console.error(`  ${c.red("-")} [${service}] Error: ${msg}`);}
 
 //Formats a Firestore timestamp safely.
 function formatTimestamp(ts) {
@@ -271,8 +310,12 @@ async function dumpFirestore() {
 
     if (!QUIET) {
       console.log(`  Firestore: ${totalDocs} docs, ${totalSubcollections} subcollections`);}
+    SERVICE_STATUS.firestore = { status: "ok" };
   } catch (e) {
-    logError("firestore", e);}}
+    if (isApiDisabledError(e)) {
+      logSkipped("firestore", "Cloud Firestore API is not enabled for this project.");
+    } else {
+      logError("firestore", e);}}}
 
 /**
  * Dumps the firebase realtime database root node.
@@ -283,8 +326,7 @@ async function dumpRealtimeDB() {
   if (!QUIET) console.log("\n[Realtime DB] Starting dump...");
 
   if (!DB_URL) {
-    if (!QUIET) console.log("  DB_URL not provided, skipping RTDB");
-    logError("rtdb", new Error("databaseURL not provided, skipped"));
+    logSkipped("rtdb", "No --db-url provided, RTDB dump skipped.");
     return;}
 
   try {
@@ -293,9 +335,13 @@ async function dumpRealtimeDB() {
     const snap = await ref.once("value");
     results.realtimeDatabase = snap.val();
     const size = JSON.stringify(results.realtimeDatabase || {}).length;
-    if (!QUIET) console.log(`  RTDB root dumped (~${size} bytes)`);
+    ok(`RTDB root dumped (~${size} bytes)`);
+    SERVICE_STATUS.rtdb = { status: "ok" };
   } catch (e) {
-    logError("rtdb", e);}}
+    if (isNotFoundError(e)) {
+      logSkipped("rtdb", "No Realtime Database provisioned for this project.");
+    } else {
+      logError("rtdb", e);}}}
 
 /**
  * Dumps all firebase auth users with pagination
@@ -357,56 +403,146 @@ async function dumpAuth() {
         results.customClaims[u.uid] = u.customClaims;}}
 
     if (!QUIET) console.log(` Total users: ${users.length}`);
+    SERVICE_STATUS.auth = { status: "ok" };
   } catch (e) {
     logError("auth", e);}}
 
 /**
- * Dumps cloud storage buckets and file metadata.
- * Does NOT download file contents.
+ * Dumps object metadata from a publicly-listable S3-compatible bucket
+ * (no AWS credentials) This only works if the buckets
+ * XML listing endpoint is already open it Only key/size/etag/timestamp metadata is
+ * captured mirroring dumpStorage()s Firebase behaviour no object content
+ * is ever downloaded
+ */
+async function dumpPublicBucket(bucketUrl) {
+  const base = bucketUrl.endsWith("/") ? bucketUrl : `${bucketUrl}/`;
+  let continuationToken = null;
+  const objects = [];
+  let bucketName = null;
+  let page = 0;
+  const MAX_PAGES = 50; // safety cap so a huge/adversarial bucket cant loop forever
+
+  do {
+    const params = new URLSearchParams({ "list-type": "2" });
+    if (continuationToken) params.set("continuation-token", continuationToken);
+
+    const resp = await fetch(`${base}?${params.toString()}`, {
+      method: "GET",
+      signal: AbortSignal.timeout(15000),});
+    const text = await resp.text();
+
+    if (!resp.ok) {
+      if (resp.status === 403 || /AccessDenied/i.test(text)) {
+        logSkipped("storage", `Bucket exists but its listing isnt public (HTTP 403).`);
+        return;}
+      if (resp.status === 404 || /NoSuchBucket/i.test(text)) {
+        logSkipped("storage", `Bucket not found at this URL (HTTP 404).`);
+        return;}
+      throw new Error(`HTTP ${resp.status} while listing bucket`);}
+
+    bucketName = bucketName || (text.match(/<Name>([^<]*)<\/Name>/) || [])[1] || bucketUrl;
+
+    const contentBlocks = text.match(/<Contents>[\s\S]*?<\/Contents>/g) || [];
+    for (const block of contentBlocks) {
+      objects.push({
+        key: (block.match(/<Key>([^<]*)<\/Key>/) || [])[1] || null,
+        size: Number((block.match(/<Size>([^<]*)<\/Size>/) || [])[1]) || null,
+        lastModified: (block.match(/<LastModified>([^<]*)<\/LastModified>/) || [])[1] || null,
+        etag: ((block.match(/<ETag>([^<]*)<\/ETag>/) || [])[1] || "").replace(/"/g, "") || null,
+        storageClass: (block.match(/<StorageClass>([^<]*)<\/StorageClass>/) || [])[1] || null,});}
+
+    page++;
+    if (!QUIET) console.log(`  Page ${page}: ${contentBlocks.length} objects`);
+
+    const isTruncated = /<IsTruncated>true<\/IsTruncated>/i.test(text);
+    continuationToken = isTruncated
+      ? (text.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/) || [])[1] || null
+      : null;
+
+    if (continuationToken && page >= MAX_PAGES) {
+      warn(`Reached ${MAX_PAGES}-page cap stopping pagination early`);
+      break;}
+  } while (continuationToken);
+
+  results.storage.buckets.push({ name: bucketName, source: "public-anonymous-listing", url: bucketUrl });
+  results.storage.files[bucketName] = objects;
+  ok(`[${bucketName}] => ${objects.length} objects listed`);
+  SERVICE_STATUS.storage = { status: "ok" };}
+
+/**
+ * Dumps cloud storage buckets and file metadata
+ * Does NOT download file contents
  */
 async function dumpStorage() {
   if (!ENABLED_SERVICES.has("storage")) return;
   if (!QUIET) console.log("\n[Storage] Starting dump...");
 
+  if (BUCKET_OVERRIDE && /^https?:\/\//i.test(BUCKET_OVERRIDE)) {
+    try {
+      await dumpPublicBucket(BUCKET_OVERRIDE);
+    } catch (e) {
+      logError("storage", e);}
+    return;}
+
   try {
-    const [buckets] = await storage.getBuckets();
-    results.storage.buckets = buckets.map(b => ({
-      name: b.name,
-      id: b.id,
-      location: b.metadata?.location,
-      storageClass: b.metadata?.storageClass,
-      created: b.metadata?.timeCreated,
-      updated: b.metadata?.updated,
-      iamConfiguration: b.metadata?.iamConfiguration,
-      versioning: b.metadata?.versioning,
-      labels: b.metadata?.labels,
-      cors: b.metadata?.cors,
-      lifecycle: b.metadata?.lifecycle,}));
+    const candidateNames = BUCKET_OVERRIDE
+      ? [BUCKET_OVERRIDE]
+      : [`${projectId}.firebasestorage.app`, `${projectId}.appspot.com`];
 
-    if (!QUIET) console.log(`  Bucket count: ${buckets.length}`);
+    let bucket = null;
+    let lastErr = null;
+    for (const name of candidateNames) {
+      try {
+        const candidate = storage.bucket(name);
+        await candidate.getMetadata(); 
+        bucket = candidate;
+        break;
+      } catch (e) {
+        lastErr = e;}}
 
-    for (const bucket of buckets) {
-      const [files] = await bucket.getFiles();
-      results.storage.files[bucket.name] = files.map(f => ({
-        name: f.name,
-        size: f.metadata?.size,
-        contentType: f.metadata?.contentType,
-        contentEncoding: f.metadata?.contentEncoding,
-        updated: f.metadata?.updated,
-        created: f.metadata?.timeCreated,
-        md5Hash: f.metadata?.md5Hash,
-        crc32c: f.metadata?.crc32c,
-        generation: f.metadata?.generation,
-        metageneration: f.metadata?.metageneration,
-        storageClass: f.metadata?.storageClass,
-        mediaLink: f.metadata?.mediaLink,
-        selfLink: f.metadata?.selfLink,
-        public: f.metadata?.acl?.some(a => a.entity === "allUsers") || false,
-        owner: f.metadata?.owner,
-        metadata: f.metadata?.metadata,
-        cacheControl: f.metadata?.cacheControl,}));
+    if (!bucket) {
+      throw new Error(
+        `No accessible bucket found (tried: ${candidateNames.join(", ")}) ` +
+        `Pass --bucket <name> explicitly Last error: ${lastErr?.message}`);}
 
-      if (!QUIET) console.log(`  [${bucket.name}] => ${files.length} files`);}
+    const [metadata] = await bucket.getMetadata();
+    results.storage.buckets.push({
+      name: metadata.name,
+      id: metadata.id,
+      location: metadata.location,
+      storageClass: metadata.storageClass,
+      created: metadata.timeCreated,
+      updated: metadata.updated,
+      iamConfiguration: metadata.iamConfiguration,
+      versioning: metadata.versioning,
+      labels: metadata.labels,
+      cors: metadata.cors,
+      lifecycle: metadata.lifecycle,});
+
+    if (!QUIET) console.log(`  Using bucket: ${bucket.name}`);
+
+    const [files] = await bucket.getFiles();
+    results.storage.files[bucket.name] = files.map(f => ({
+      name: f.name,
+      size: f.metadata?.size,
+      contentType: f.metadata?.contentType,
+      contentEncoding: f.metadata?.contentEncoding,
+      updated: f.metadata?.updated,
+      created: f.metadata?.timeCreated,
+      md5Hash: f.metadata?.md5Hash,
+      crc32c: f.metadata?.crc32c,
+      generation: f.metadata?.generation,
+      metageneration: f.metadata?.metageneration,
+      storageClass: f.metadata?.storageClass,
+      mediaLink: f.metadata?.mediaLink,
+      selfLink: f.metadata?.selfLink,
+      public: f.metadata?.acl?.some(a => a.entity === "allUsers") || false,
+      owner: f.metadata?.owner,
+      metadata: f.metadata?.metadata,
+      cacheControl: f.metadata?.cacheControl,}));
+
+    if (!QUIET) console.log(`  [${bucket.name}] => ${files.length} files`);
+    SERVICE_STATUS.storage = { status: "ok" };
   } catch (e) {
     logError("storage", e);}}
 
@@ -416,8 +552,9 @@ async function dumpProjectConfig() {
   if (!QUIET) console.log("\n[Project Config] Starting dump...");
 
   try {
-    results.projectConfig = await auth.getProjectConfig();
+    results.projectConfig = await auth.projectConfigManager().getProjectConfig();
     if (!QUIET) console.log("  Project config read");
+    SERVICE_STATUS.projectConfig = { status: "ok" };
   } catch (e) {
     logError("projectConfig", e);}}
 
@@ -428,26 +565,64 @@ async function dumpSecurityRules() {
 
   try {
     const securityRules = getSecurityRules(app);
-    const [releases] = await securityRules.listReleases();
 
-    results.securityRules.releases = releases.map(r => ({
-      name: r.name,
-      rulesetName: r.rulesetName,
-      createTime: r.createTime,
-      updateTime: r.updateTime,}));
+    // The SDK only exposes whatever ruleset is currently deployed
+    let allMetadata = [];
+    let pageToken;
+    try {
+      do {
+        const page = await securityRules.listRulesetMetadata(100, pageToken);
+        allMetadata = allMetadata.concat(page.rulesets || []);
+        pageToken = page.nextPageToken;
+      } while (pageToken);
+    } catch (e) {
+      if (/Invalid ListRulesets response/i.test(e.message)) {
+        logSkipped("securityRules", "No rulesets exist in this project yet");
+        allMetadata = [];
+      } else {
+        throw e;}}
 
-    for (const rel of releases) {
+    results.securityRules.rulesetMetadata = allMetadata.map(m => ({
+      name: m.name,
+      createTime: m.createTime,}));
+
+    for (const meta of allMetadata) {
       try {
-        const ruleset = await securityRules.getRuleset(rel.rulesetName);
+        const ruleset = await securityRules.getRuleset(meta.name);
         results.securityRules.rulesets.push({
           name: ruleset.name,
           source: ruleset.source?.files?.map(f => ({ name: f.name, content: f.content })),
           createTime: ruleset.createTime,});
       } catch (inner) {
-        logError(`securityRules.ruleset(${rel.rulesetName})`, inner);}}
+        logError(`securityRules.ruleset(${meta.name})`, inner);}}
+
+    try {
+      const firestoreRuleset = await securityRules.getFirestoreRuleset();
+      results.securityRules.releases.push({
+        service: "cloud.firestore",
+        rulesetName: firestoreRuleset.name,
+        createTime: firestoreRuleset.createTime,});
+    } catch (inner) {
+      if (isNotFoundError(inner)) {
+        logSkipped("securityRules", "No Firestore ruleset is currently deployed");
+      } else {
+        logError("securityRules.getFirestoreRuleset", inner);}}
+
+    try {
+      const storageRuleset = await securityRules.getStorageRuleset();
+      results.securityRules.releases.push({
+        service: "firebase.storage",
+        rulesetName: storageRuleset.name,
+        createTime: storageRuleset.createTime,});
+    } catch (inner) {
+      if (isNotFoundError(inner)) {
+        logSkipped("securityRules", "No Storage ruleset is currently deployed");
+      } else {
+        logError("securityRules.getStorageRuleset", inner);}}
 
     if (!QUIET) {
-      console.log(`  [OK] ${releases.length} releases, ${results.securityRules.rulesets.length} rulesets`);}
+      console.log(`  [OK] ${allMetadata.length} rulesets, ${results.securityRules.releases.length} active releases`);}
+    SERVICE_STATUS.securityRules = SERVICE_STATUS.securityRules || { status: "ok" };
   } catch (e) {
     logError("securityRules", e);}}
 
@@ -460,6 +635,7 @@ async function dumpAppCheck() {
     const appCheck = getAppCheck(app);
     results.appCheck = { available: true, note: "App Check instance accessible" };
     if (!QUIET) console.log(" App Check accessible");
+    SERVICE_STATUS.appCheck = { status: "ok" };
   } catch (e) {
     results.appCheck = { available: false, error: e.message };
     logError("appCheck", e);}}
@@ -473,6 +649,7 @@ async function dumpFCM() {
     const messaging = getMessaging(app);
     results.fcm = { accessible: true, note: "FCM messaging() instance accessible" };
     if (!QUIET) console.log("  FCM accessible");
+    SERVICE_STATUS.fcm = { status: "ok" };
   } catch (e) {
     logError("fcm", e);}}
 
@@ -492,6 +669,7 @@ async function dumpRemoteConfig() {
       etag: template.etag,};
       
     if (!QUIET) console.log("  Remote Config template fetched");
+    SERVICE_STATUS.remoteConfig = { status: "ok" };
   } catch (e) {
     logError("remoteConfig", e);}}
 
@@ -514,8 +692,12 @@ async function dumpML() {
       modelHash: m.modelHash,
       tags: m.tags,}));
     if (!QUIET) console.log(`  ${models.length} ML models found`);
+    SERVICE_STATUS.ml = { status: "ok" };
   } catch (e) {
-    logError("ml", e);}}
+    if (isApiDisabledError(e)) {
+      logSkipped("ml", "Firebase ML API is not enabled for this project.");
+    } else {
+      logError("ml", e);}}}
 
 // Dumps sanitized service account metadata 
 async function dumpServiceAccountInfo() {
@@ -570,12 +752,23 @@ async function main() {
   const duration = ((Date.now() - start) / 1000).toFixed(2);
 
   if (!QUIET) {
-    console.log(`Done in ${duration}s`);
-    console.log(`Output: ${path.resolve(OUTPUT_DIR)}`);
-    console.log(`Errors: ${results.errors.length}`);
-    if (results.errors.length > 0) {
-      console.log("Errors:");
-      results.errors.forEach(e => console.log(`  - ${e.service}: ${e.error}`));}}}
+    const okCount = Object.values(SERVICE_STATUS).filter(s => s.status === "ok").length;
+    const skipCount = results.skipped.length;
+    const errCount = results.errors.length;
+
+    console.log(`\n${c.bold("Summary")}`);
+    const rows = Object.entries(SERVICE_STATUS).sort(([a], [b]) => a.localeCompare(b));
+    const nameWidth = Math.max(...rows.map(([name]) => name.length), 8);
+    for (const [name, info] of rows) {
+      const label = name.padEnd(nameWidth);
+      if (info.status === "ok") console.log(`  ${c.green("+")} ${label}  ${c.dim("ok")}`);
+      else if (info.status === "skipped") console.log(`  ${c.yellow("*")} ${label}  ${c.dim(info.detail)}`);
+      else console.log(`  ${c.red("-")} ${label}  ${c.red(info.detail)}`);}
+
+    console.log("");
+    console.log(`Duration : ${duration}s`);
+    console.log(`Output   : ${path.resolve(OUTPUT_DIR)}`);
+    console.log(`${c.green("OK")}: ${okCount}   ${c.yellow("Skipped")}: ${skipCount}   ${c.red("Errors")}: ${errCount}`);}}
 
 main().catch(e => {
   console.error("[FATAL]", e.message);

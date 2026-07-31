@@ -1,6 +1,6 @@
 {
   "name": "firebase-dump",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "description": "Firebase project dump extracts firestore, auth, storage, rtdb and more via Admin SDK",
   "main": "firebase-dump.js",
   "bin": {
