@@ -20,4 +20,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: google/osv-scanner-action@main
+      - uses: google/osv-scanner-action@v2.3.8
