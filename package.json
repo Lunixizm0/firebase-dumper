@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "node firebase-dump.js",
-    "dump": "node firebase-dump.js"
+    "dump": "node firebase-dump.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
   },
   "keywords": [
     "firebase",
@@ -26,5 +28,18 @@
     "@firebase/app": "^0.16.0",
     "commander": "^15.0.0",
     "firebase-admin": "^14.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-jsdoc": "^63.3.2",
+    "eslint-plugin-n": "^18.2.2",
+    "eslint-plugin-no-secrets": "^2.3.3",
+    "eslint-plugin-promise": "^7.3.0",
+    "eslint-plugin-regexp": "^3.1.1",
+    "eslint-plugin-security": "^4.0.1",
+    "eslint-plugin-sonarjs": "^4.2.0",
+    "globals": "^17.8.0"
   }
 }
