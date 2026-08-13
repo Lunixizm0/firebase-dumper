@@ -335,8 +335,8 @@ function saveJson(name, data) {
     // Atomic write to a unique temp file with exclusive create, then rename
     // into place. The data is validated by sanitizeForWrite, size-bounded, and
     // written with restrictive 0600 permissions. Writing dumped data to files
-    // is the explicit purpose of this tool.
-    // codeql[js/http-to-file-access]
+    // is the explicit purpose of this tool, so the js/http-to-file-access
+    // CodeQL alert is dismissed as won't-fix.
     fs.writeFileSync(tmpPath, serialized, { mode: 0o600, flag: "wx" });
     fs.renameSync(tmpPath, filePath);
     if (!QUIET) console.log(`Saved: ${filePath}`);
