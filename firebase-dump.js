@@ -17,6 +17,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { randomBytes } = require("crypto");
 const { program } = require("commander");
 
 // cli
@@ -324,15 +325,19 @@ function sanitizeForWrite(value, depth = 0) {
 
 function saveJson(name, data) {
   const filePath = path.join(OUTPUT_DIR, `${name}.json`);
-  const tmpPath = path.join(OUTPUT_DIR, `.${name}.json.tmp`);
+  const tmpPath = path.join(OUTPUT_DIR,
+    `.${name}-${process.pid}-${randomBytes(4).toString("hex")}.json.tmp`);
   try {
     const serialized = JSON.stringify(sanitizeForWrite(data), null, 2);
     if (Buffer.byteLength(serialized, "utf8") > MAX_DUMP_FILE_BYTES) {
       throw new Error(
         `serialized output exceeds ${MAX_DUMP_FILE_BYTES} byte limit, refusing to write`);}
-    // Atomic write: write to a temp file, then rename into place. This avoids
-    // leaving partially written or world-readable dump files behind.
-    fs.writeFileSync(tmpPath, serialized, { mode: 0o600, flag: "w" });
+    // Atomic write to a unique temp file with exclusive create, then rename
+    // into place. The data is validated by sanitizeForWrite, size-bounded, and
+    // written with restrictive 0600 permissions. Writing dumped data to files
+    // is the explicit purpose of this tool.
+    // codeql[js/http-to-file-access]
+    fs.writeFileSync(tmpPath, serialized, { mode: 0o600, flag: "wx" });
     fs.renameSync(tmpPath, filePath);
     if (!QUIET) console.log(`Saved: ${filePath}`);
   } catch (e) {
