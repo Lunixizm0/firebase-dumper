@@ -1,40 +1,41 @@
-const js = require("@eslint/js");
-const globals = require("globals");
+import js from "@eslint/js";
+import globals from "globals";
+import tseslint from "typescript-eslint";
 
-const security = require("eslint-plugin-security");
-const sonarjs = require("eslint-plugin-sonarjs");
-const importPlugin = require("eslint-plugin-import");
-const promise = require("eslint-plugin-promise");
-const node = require("eslint-plugin-n");
-const regexp = require("eslint-plugin-regexp");
-const noSecrets = require("eslint-plugin-no-secrets");
+import security from "eslint-plugin-security";
+import sonarjs from "eslint-plugin-sonarjs";
+import promise from "eslint-plugin-promise";
+import node from "eslint-plugin-n";
+import regexp from "eslint-plugin-regexp";
+import noSecrets from "eslint-plugin-no-secrets";
 
-module.exports = [
+export default tseslint.config(
   {
     ignores: [
       "node_modules/**",
       "firebase_dump/**",
       "coverage/**",
       "dist/**",
-      "build/**"
+      "build/**",
+      ".test-tmp-*/**"
     ]
   },
 
   js.configs.recommended,
 
-  {
-    files: ["**/*.js"],
+  ...tseslint.configs.recommended,
 
+  {
+    files: ["**/*.ts"],
     languageOptions: {
       ecmaVersion: "latest",
-      sourceType: "commonjs",
+      sourceType: "module",
       globals: globals.node
     },
 
     plugins: {
       security,
       sonarjs,
-      import: importPlugin,
       promise,
       n: node,
       regexp,
@@ -42,33 +43,29 @@ module.exports = [
     },
 
     rules: {
-      // Recommended rule setleri
       ...security.configs.recommended.rules,
       ...sonarjs.configs.recommended.rules,
       ...promise.configs.recommended.rules,
       ...regexp.configs["flat/recommended"].rules,
 
-      // JS
+      // JS/TS
       "no-eval": "error",
       "no-implied-eval": "error",
       "no-new-func": "error",
-      "no-unused-vars": [
+      "@typescript-eslint/no-unused-vars": [
         "warn",
         {
           argsIgnorePattern: "^_",
           ignoreRestSiblings: true
         }
       ],
+      "@typescript-eslint/no-explicit-any": "off",
+      "@typescript-eslint/no-unused-expressions": "off",
 
       // Security
       "security/detect-child-process": "error",
       "security/detect-non-literal-fs-filename": "warn",
       "security/detect-object-injection": "off",
-
-      // Import
-      "import/no-duplicates": "error",
-      "import/no-self-import": "error",
-      "import/no-cycle": "error",
 
       // Promise
       "promise/catch-or-return": "error",
@@ -89,5 +86,24 @@ module.exports = [
         }
       ]
     }
+  },
+
+  {
+    files: ["test/**/*.ts"],
+    rules: {
+      "security/detect-child-process": "off",
+      "sonarjs/no-duplicate-string": "off",
+      "sonarjs/publicly-writable-directories": "off",
+      "no-control-regex": "off"
+    }
+  },
+
+  {
+    files: ["eslint.config.js", "vitest.config.ts"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: globals.node
+    }
   }
-];
+);

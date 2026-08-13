@@ -1,7 +1,14 @@
 # Dependencies
 node_modules/
-package-lock.json
 yarn.lock
+
+# Build output
+dist/
+coverage/
+
+# Test fixtures
+.test-tmp-*
+test-run-out/
 
 # Service Account Keys
 serviceAccountKey.json
