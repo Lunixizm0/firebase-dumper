@@ -255,7 +255,6 @@ export interface ServiceAccountInfo {
   client_x509_cert_url?: string;
   universe_domain?: string;
   hasPrivateKey: boolean;
-  privateKeyLength?: number;
 }
 
 export interface DumpResult {

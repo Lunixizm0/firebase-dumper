@@ -16,6 +16,9 @@ interface DownloadFileLike {
 function safeRelativePath(objectName: string): string {
   const segments = objectName.split("/").filter((s) => s !== "" && s !== ".");
   for (const segment of segments) {
+    if (/[\\:]/.test(segment)) {
+      throw new Error(`Unsafe storage object name segment: "${segment}"`);
+    }
     if (!isSafePath(segment)) {
       throw new Error(`Unsafe storage object name segment: "${segment}"`);
     }
@@ -23,12 +26,21 @@ function safeRelativePath(objectName: string): string {
   return segments.join(path.sep);
 }
 
+async function ensureContained(destination: string, realBase: string): Promise<void> {
+  await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+  const realDir = await fs.promises.realpath(path.dirname(destination));
+  if (realDir !== realBase && !realDir.startsWith(realBase + path.sep)) {
+    throw new Error("Refusing to write outside the storage_files directory (symlink detected)");
+  }
+}
+
 async function downloadOne(
   file: DownloadFileLike,
   destination: string,
+  realBase: string,
   maxBytes: number
 ): Promise<number> {
-  await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+  await ensureContained(destination, realBase);
 
   let bytes = 0;
   const counter = new Transform({
@@ -58,7 +70,14 @@ export async function downloadStorageFiles(
   const { config, logger } = ctx;
   if (!config.storageDownload) return;
 
+  if (!isSafePath(bucketName)) {
+    logErrorWithMessage(ctx, "storage.download", `Unsafe storage bucket name: "${bucketName}"`);
+    return;
+  }
+
   const baseDir = path.join(config.outputDir, "storage_files", bucketName);
+  await fs.promises.mkdir(baseDir, { recursive: true });
+  const realBase = await fs.promises.realpath(baseDir);
   let downloaded = 0;
   let skipped = 0;
 
@@ -80,7 +99,7 @@ export async function downloadStorageFiles(
 
     const destination = path.join(baseDir, relative);
     try {
-      await downloadOne(file, destination, config.storageDownloadMaxBytes);
+      await downloadOne(file, destination, realBase, config.storageDownloadMaxBytes);
       downloaded++;
     } catch (e) {
       try {

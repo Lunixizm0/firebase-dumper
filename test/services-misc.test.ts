@@ -6,7 +6,7 @@ import { dumpAppCheck } from "../src/services/app-check.ts";
 import { dumpRemoteConfig } from "../src/services/remote-config.ts";
 import { dumpML } from "../src/services/ml.ts";
 import { dumpProjectConfig } from "../src/services/project-config.ts";
-import { dumpPublicBucket } from "../src/services/public-bucket.ts";
+import { dumpPublicBucket, assertExternalFetchable } from "../src/services/public-bucket.ts";
 import { makeCtx, onlyServices } from "./helpers.ts";
 
 const rtdbMocks = vi.hoisted(() => ({ once: vi.fn(), goOffline: vi.fn() }));
@@ -324,20 +324,21 @@ describe("dumpProjectConfig", () => {
   });
 });
 
+const page1Xml =
+  "<ListBucketResult>" +
+  "<Name>proj.appspot.com</Name>" +
+  "<IsTruncated>true</IsTruncated>" +
+  "<NextContinuationToken>tok2</NextContinuationToken>" +
+  "<Contents><Key>a.txt</Key><Size>10</Size><LastModified>2024-01-01</LastModified><ETag>\"abc\"</ETag></Contents>" +
+  "</ListBucketResult>";
+const page2Xml =
+  "<ListBucketResult>" +
+  "<Name>proj.appspot.com</Name>" +
+  "<IsTruncated>false</IsTruncated>" +
+  "<Contents><Key>b.txt</Key><Size>20</Size><LastModified>2024-01-02</LastModified><ETag>\"def\"</ETag></Contents>" +
+  "</ListBucketResult>";
+
 describe("dumpPublicBucket", () => {
-  const page1Xml =
-    "<ListBucketResult>" +
-    "<Name>proj.appspot.com</Name>" +
-    "<IsTruncated>true</IsTruncated>" +
-    "<NextContinuationToken>tok2</NextContinuationToken>" +
-    "<Contents><Key>a.txt</Key><Size>10</Size><LastModified>2024-01-01</LastModified><ETag>\"abc\"</ETag></Contents>" +
-    "</ListBucketResult>";
-  const page2Xml =
-    "<ListBucketResult>" +
-    "<Name>proj.appspot.com</Name>" +
-    "<IsTruncated>false</IsTruncated>" +
-    "<Contents><Key>b.txt</Key><Size>20</Size><LastModified>2024-01-02</LastModified><ETag>\"def\"</ETag></Contents>" +
-    "</ListBucketResult>";
 
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -383,5 +384,66 @@ describe("dumpPublicBucket", () => {
 
     expect(ctx.statuses.get("storage")?.status).toBe("skipped");
     expect(ctx.results.skipped[0]?.reason).toMatch(/isnt public/i);
+  });
+
+  it("passes redirect:error to fetch", async () => {
+    const fetchMock = vi.fn(async (_url: string, options: RequestInit) => new Response(page1Xml, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = bucketCtx();
+
+    await dumpPublicBucket(ctx, "https://firebasestorage.googleapis.com/v0/b/proj.appspot.com/o");
+
+    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("error");
+  });
+});
+
+describe("assertExternalFetchable", () => {
+  const okUrls = [
+    "https://firebasestorage.googleapis.com/v0/b/proj.appspot.com/o",
+    "https://storage.googleapis.com/proj.appspot.com",
+    "http://[2001:4860:4860::8888]/x" // eslint-disable-line sonarjs/no-clear-text-protocols
+  ];
+  const blockedUrls = [
+    /* eslint-disable sonarjs/no-clear-text-protocols */
+    "http://169.254.169.254/latest/meta-data/",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://metadata/latest/meta-data/",
+    "http://127.0.0.1/",
+    "http://10.0.0.5/",
+    "http://172.16.5.5/",
+    "http://192.168.1.1/",
+    "http://0.0.0.0/",
+    "http://[::1]/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[fd00::1]/",
+    "http://[fe80::1]/",
+    /* eslint-enable sonarjs/no-clear-text-protocols */
+    "ftp://example.com/x",
+    "file:///etc/passwd",
+    "not-a-url"
+  ];
+
+  it("accepts public hosts", () => {
+    for (const url of okUrls) {
+      expect(() => assertExternalFetchable(url), url).not.toThrow();
+    }
+  });
+
+  it("rejects metadata, private and reserved hosts", () => {
+    for (const url of blockedUrls) {
+      expect(() => assertExternalFetchable(url), url).toThrow(/not allowed|Invalid bucket URL|scheme must be/);
+    }
+  });
+
+  it("rejects blocked hosts inside dumpPublicBucket before fetching", async () => {
+    const fetchMock = vi.fn(async () => new Response(page1Xml, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = makeCtx({}, { enabledServices: onlyServices("storage"), retries: 0 });
+
+    await expect(
+      dumpPublicBucket(ctx, "http://169.254.169.254/latest/meta-data/")  
+    ).rejects.toThrow(/not allowed/);
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

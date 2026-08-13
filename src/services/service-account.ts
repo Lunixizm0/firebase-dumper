@@ -18,8 +18,7 @@ export async function dumpServiceAccount(ctx: ServiceContext): Promise<void> {
     auth_provider_x509_cert_url: serviceAccount.auth_provider_x509_cert_url,
     client_x509_cert_url: serviceAccount.client_x509_cert_url,
     universe_domain: serviceAccount.universe_domain,
-    hasPrivateKey: !!serviceAccount.private_key,
-    privateKeyLength: serviceAccount.private_key?.length
+    hasPrivateKey: !!serviceAccount.private_key
   };
   results._serviceAccountInfo = info;
 

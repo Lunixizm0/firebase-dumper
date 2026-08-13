@@ -174,4 +174,53 @@ describe("dumpStorage", () => {
     expect(fs.existsSync(path.join(base, "dir"))).toBe(false);
     expect(fs.existsSync(path.join(base, "big.bin"))).toBe(false);
   });
+
+  it("skips objects whose names contain traversal or platform-unsafe characters", async () => {
+    const outDir = makeTmpDir();
+    const files = [
+      makeFile("..\\evil.txt", { metadata: { size: 5 }, createReadStream: () => Readable.from(["x"]) }),
+      makeFile("C:ads.txt", { metadata: { size: 5 }, createReadStream: () => Readable.from(["x"]) }),
+      makeFile("ok.txt", { metadata: { size: 3 }, createReadStream: () => Readable.from(["abc"]) })
+    ];
+    const bucket = makeBucket("test-project.firebasestorage.app", [[files, undefined]]);
+    const ctx = makeCtx(
+      { storage: { bucket: vi.fn(() => bucket) } },
+      { enabledServices: onlyServices("storage"), storageDownload: true, outputDir: outDir }
+    );
+
+    await dumpStorage(ctx);
+
+    const base = path.join(outDir, "storage_files", "test-project.firebasestorage.app");
+    expect(fs.existsSync(path.join(base, "..", "evil.txt"))).toBe(false);
+    expect(ctx.results.errors.some((e) => /Unsafe storage object name/.test(e.error))).toBe(true);
+    expect(fs.readFileSync(path.join(base, "ok.txt"), "utf8")).toBe("abc");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses to write through a symlinked directory pointing outside the output dir",
+    async () => {
+      const outDir = makeTmpDir();
+      const outsideDir = makeTmpDir();
+      fs.mkdirSync(path.join(outDir, "storage_files", "test-project.firebasestorage.app"), { recursive: true });
+      fs.symlinkSync(
+        outsideDir,
+        path.join(outDir, "storage_files", "test-project.firebasestorage.app", "link"),
+        "dir"
+      );
+      const file = makeFile("link/escape.txt", {
+        metadata: { size: 5 },
+        createReadStream: () => Readable.from(["x"])
+      });
+      const bucket = makeBucket("test-project.firebasestorage.app", [[[file], undefined]]);
+      const ctx = makeCtx(
+        { storage: { bucket: vi.fn(() => bucket) } },
+        { enabledServices: onlyServices("storage"), storageDownload: true, outputDir: outDir }
+      );
+
+      await dumpStorage(ctx);
+
+      expect(ctx.results.errors.some((e) => /symlink/.test(e.error))).toBe(true);
+      expect(fs.existsSync(path.join(outsideDir, "escape.txt"))).toBe(false);
+    }
+  );
 });
