@@ -35,6 +35,7 @@ describe("dumpStorage", () => {
   let tmpDirs: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
     tmpDirs = [];
   });
@@ -92,6 +93,77 @@ describe("dumpStorage", () => {
 
     expect(ctx.statuses.get("storage")?.status).toBe("skipped");
     expect(ctx.results.skipped[0]?.reason).toMatch(/No Storage bucket is provisioned/);
+  });
+
+  it("dumps a public bucket when --bucket is a URL", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          "<ListBucketResult><Name>proj.appspot.com</Name><IsTruncated>false</IsTruncated>" +
+            "<Contents><Key>a.txt</Key><Size>10</Size></Contents></ListBucketResult>",
+          { status: 200 }
+        )
+      )
+    );
+    const ctx = makeCtx(
+      {},
+      {
+        enabledServices: onlyServices("storage"),
+        bucketOverride: "https://firebasestorage.googleapis.com/v0/b/proj.appspot.com/o"
+      }
+    );
+
+    await dumpStorage(ctx);
+
+    expect(ctx.statuses.get("storage")?.status).toBe("ok");
+    const files = ctx.results.storage.files["proj.appspot.com"] as Array<{ key: string }>;
+    expect(files.map((f) => f.key)).toEqual(["a.txt"]);
+  });
+
+  it("records an error when the --bucket URL host is not allowed", async () => {
+    const fetchMock = vi.fn(async () => new Response("nope", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = makeCtx(
+      {},
+      {
+        enabledServices: onlyServices("storage"),
+        bucketOverride: "http://169.254.169.254/latest/meta-data/"  
+      }
+    );
+
+    await dumpStorage(ctx);
+
+    expect(ctx.statuses.get("storage")?.status).toBe("error");
+    expect(ctx.results.errors[0]?.error).toMatch(/not allowed/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("marks files whose ACL grants allUsers as public", async () => {
+    const bucket = makeBucket("test-project.firebasestorage.app", [
+      [
+        [
+          makeFile("pub.txt", {
+            metadata: { size: 5, contentType: "text/plain", acl: [{ entity: "allUsers", role: "READER" }] }
+          }),
+          makeFile("priv.txt")
+        ],
+        undefined
+      ]
+    ]);
+    const ctx = makeCtx(
+      { storage: { bucket: vi.fn(() => bucket) } },
+      { enabledServices: onlyServices("storage") }
+    );
+
+    await dumpStorage(ctx);
+
+    const files = ctx.results.storage.files["test-project.firebasestorage.app"] as Array<{
+      name: string;
+      public: boolean;
+    }>;
+    expect(files.find((f) => f.name === "pub.txt")?.public).toBe(true);
+    expect(files.find((f) => f.name === "priv.txt")?.public).toBe(false);
   });
 
   it("lists files with pagination", async () => {

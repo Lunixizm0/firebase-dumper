@@ -386,6 +386,25 @@ describe("dumpPublicBucket", () => {
     expect(ctx.results.skipped[0]?.reason).toMatch(/isnt public/i);
   });
 
+  it("skips when the bucket is not found", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<Error><Code>NoSuchBucket</Code></Error>", { status: 404 })));
+    const ctx = bucketCtx();
+
+    await dumpPublicBucket(ctx, "https://firebasestorage.googleapis.com/v0/b/missing/o");
+
+    expect(ctx.statuses.get("storage")?.status).toBe("skipped");
+    expect(ctx.results.skipped[0]?.reason).toMatch(/not found/i);
+  });
+
+  it("throws on other non-ok responses", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+    const ctx = bucketCtx();
+
+    await expect(
+      dumpPublicBucket(ctx, "https://firebasestorage.googleapis.com/v0/b/proj.appspot.com/o")
+    ).rejects.toThrow(/HTTP 500/);
+  });
+
   it("passes redirect:error to fetch", async () => {
     const fetchMock = vi.fn(async (_url: string, options: RequestInit) => new Response(page1Xml, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
