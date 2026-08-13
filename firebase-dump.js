@@ -258,12 +258,89 @@ function logSkipped(service, reason) {
   results.skipped.push({ service, reason });
   SERVICE_STATUS[service] = { status: "skipped", detail: reason };
   warn(`${service}: ${reason}`);}
+// Maximum size for a single dump file (100 MB) and maximum nesting depth.
+const MAX_DUMP_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_DUMP_DEPTH = 64;
+// Maximum size of a single network response we are willing to buffer.
+const MAX_NETWORK_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+// Reads a fetch response body as text but refuses to buffer more than
+// maxBytes, so an oversized or hostile endpoint cannot exhaust memory.
+async function readTextLimited(response, maxBytes) {
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > maxBytes) {
+    throw new Error(`Response too large (${contentLength} bytes)`);}
+  if (!response.body) return response.text();
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        throw new Error(`Response exceeds ${maxBytes} byte limit`);}
+      chunks.push(value);}
+  } finally {
+    reader.releaseLock();}
+  return Buffer.concat(chunks).toString("utf8");}
+
+// Validates and normalizes untrusted (e.g. network or file sourced) data before
+// it is written to disk. Throws when a value cannot be safely serialized so no
+// arbitrary object (function, symbol, BigInt, prototype key, ...) ever reaches
+// the file system.
+function sanitizeForWrite(value, depth = 0) {
+  if (depth > MAX_DUMP_DEPTH) {
+    throw new Error(`Dump data exceeds maximum nesting depth (${MAX_DUMP_DEPTH})`);}
+  if (value === null || value === undefined) return null;
+
+  switch (typeof value) {
+    case "boolean":
+    case "string":
+      return value;
+    case "number":
+      if (!Number.isFinite(value)) {
+        throw new Error("Dump data contains a non-finite number");}
+      return value;
+    case "bigint":
+      throw new Error("Dump data contains a BigInt value");
+    case "function":
+    case "symbol":
+      throw new Error(`Dump data contains an unsupported ${typeof value} value`);
+    case "object": {
+      if (Array.isArray(value)) {
+        return value.map(item => sanitizeForWrite(item, depth + 1));}
+      // Respect toJSON (Date, Buffer, Firestore types) like JSON.stringify does.
+      if (typeof value.toJSON === "function") {
+        return sanitizeForWrite(value.toJSON(), depth + 1);}
+      const entries = Object.entries(value).map(([key, val]) =>
+        [key, sanitizeForWrite(val, depth + 1)]);
+      // Object.fromEntries creates own properties, blocking __proto__ pollution.
+      return Object.fromEntries(entries);}
+    default:
+      throw new Error(`Dump data contains an unsupported value type: ${typeof value}`);}}
+
 function saveJson(name, data) {
   const filePath = path.join(OUTPUT_DIR, `${name}.json`);
+  const tmpPath = path.join(OUTPUT_DIR, `.${name}.json.tmp`);
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    const serialized = JSON.stringify(sanitizeForWrite(data), null, 2);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_DUMP_FILE_BYTES) {
+      throw new Error(
+        `serialized output exceeds ${MAX_DUMP_FILE_BYTES} byte limit, refusing to write`);}
+    // Atomic write: write to a temp file, then rename into place. This avoids
+    // leaving partially written or world-readable dump files behind.
+    fs.writeFileSync(tmpPath, serialized, { mode: 0o600, flag: "w" });
+    fs.renameSync(tmpPath, filePath);
     if (!QUIET) console.log(`Saved: ${filePath}`);
   } catch (e) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // best effort cleanup of the temp file, nothing else we can do
+    }
     console.error(`[ERROR] Failed to write ${filePath}: ${e.message}`);
     results.errors.push({ service: "filesystem", error: e.message });}}
 
@@ -457,7 +534,7 @@ async function dumpPublicBucket(bucketUrl) {
     const resp = await fetch(`${base}?${params.toString()}`, {
       method: "GET",
       signal: AbortSignal.timeout(15000),});
-    const text = await resp.text();
+    const text = await readTextLimited(resp, MAX_NETWORK_RESPONSE_BYTES);
 
     if (!resp.ok) {
       if (resp.status === 403 || /AccessDenied/i.test(text)) {
@@ -669,7 +746,7 @@ async function dumpAppCheck() {
     const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${accessToken}` },
       signal: AbortSignal.timeout(15000),});
-    const body = await resp.text();
+    const body = await readTextLimited(resp, MAX_NETWORK_RESPONSE_BYTES);
 
     if (resp.status === 401 || resp.status === 403) {
       logSkipped("appCheck",
