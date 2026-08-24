@@ -48,7 +48,7 @@
   "dependencies": {
     "@firebase/app": "^0.11.5",
     "commander": "^15.0.0",
-    "firebase-admin": "^14.2.0",
+    "firebase-admin": "^14.3.0",
     "tar": "^7.5.22"
   },
   "overrides": {
