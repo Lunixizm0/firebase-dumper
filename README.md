@@ -12,7 +12,13 @@ Firebase project dump tool. Extracts Firestore, Auth, Storage, Realtime Database
 
 ---
 
-## Installation
+## Installation (npm)
+
+```bash
+npm i -g firebase-dump
+```
+
+## Installation (Github)
 
 ```bash
 git clone https://github.com/Lunixizm0/firebase-dumper.git
