@@ -39,3 +39,4 @@ dump/
 # Logs
 *.log
 npm-debug.log*
+*.json
